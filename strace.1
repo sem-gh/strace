@@ -355,8 +355,9 @@ is one of
 .BR raw ,
 .BR signal ,
 .BR read ,
+.BR write ,
 or
-.B write
+.B fault
 and
 .I value
 is a qualifier-dependent symbol or number.  The default
@@ -480,6 +481,52 @@ Note that this is independent from the normal tracing of the
 .BR write (2)
 system call which is controlled by the option
 .BR -e "\ " trace = write .
+.TP
+\fB\-e\ fault\fR=\,\fIset\fR[:\fBerror\fR=\,\fIerrno\/\fR][:\fBwhen=\,\fIexpr\/\fR]
+Perform a syscall fault injection for the specified set of syscalls.
+When a fault is injected to a syscall invocation, the syscall number
+is replaced by -1 which corresponds to an invalid syscall.
+If an error code within 1..4095 range is specified, it overrides
+the default error code returned by the kernel, which is traditionally
+.B ENOSYS
+for invalid syscall numbers on most architectures.
+Unless a :\fBwhen\fR=\,\fIexpr\fR subexpression is specified,
+a fault is injected to every invocation of each syscall from the
+.IR set .
+The format of the subexpression is one of the following:
+.IP
+.I first
+For every syscall from the
+.IR set ,
+perform a syscall fault injection for the syscall invocation number
+.I first
+only;
+.IP
+.IR first +
+For every syscall from the
+.IR set ,
+perform syscall fault injections for the syscall invocation number
+.I first
+and all subsequent invocations;
+.IP
+.IR first + step
+For every syscall from the
+.IR set ,
+perform syscall fault injections for syscall invocations number
+.IR first ", " first + step ", " first + step + step ,
+and so on.
+.IP
+For example, to fail with ENOENT each third and subsequent chdir syscalls, use
+\fB\-e\ fault\fR=\,\fIchdir\fR:\fBerror\fR=\,\fIENOENT\/\fR:\fBwhen=\,\fI3+\/\fR.
+.IP
+The valid range for numbers
+.I first
+and
+.I step
+is 1..65535.
+.IP
+Specification of syscall fault injection can be combined
+with other syscall filtering options.
 .TP
 .BI "\-I " interruptible
 When strace can be interrupted by signals (such as pressing ^C).

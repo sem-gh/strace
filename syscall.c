@@ -360,6 +360,7 @@ update_personality(struct tcb *tcp, unsigned int personality)
 #endif
 
 static int qual_desc(const char *, unsigned int, int);
+static int qual_fault(const char *, unsigned int, int);
 static int qual_signal(const char *, unsigned int, int);
 static int qual_syscall(const char *, unsigned int, int);
 
@@ -386,6 +387,7 @@ static const struct qual_options {
 	{ QUAL_WRITE,	"write",	qual_desc,	"descriptor"	},
 	{ QUAL_WRITE,	"writes",	qual_desc,	"descriptor"	},
 	{ QUAL_WRITE,	"w",		qual_desc,	"descriptor"	},
+	{ QUAL_FAULT,	"fault",	qual_fault,	"fault argument"},
 	{ 0,		NULL,		NULL,		NULL		},
 };
 
@@ -409,20 +411,44 @@ reallocate_qual(const unsigned int n)
 	num_quals = n;
 }
 
+struct fault_opts {
+	uint16_t first;
+	uint16_t step;
+	uint16_t err;
+};
+
+static unsigned int num_faults;
+static struct fault_opts *fault_vec[SUPPORTED_PERSONALITIES];
+
+static inline void
+reallocate_fault(const unsigned int n)
+{
+	reallocate_vec((void **) fault_vec, num_faults,
+		       sizeof(struct fault_opts), n);
+	num_faults = n;
+}
+
 static void
-qualify_one(const unsigned int n, unsigned int bitflag, const int not, const int pers)
+qualify_one(const unsigned int n, unsigned int bitflag, const int not,
+	    const int pers, const struct fault_opts *fopts)
 {
 	int p;
 
-	if (num_quals <= n)
+	if (num_quals <= n) {
 		reallocate_qual(n + 1);
+		reallocate_fault(n + 1);
+	}
 
 	for (p = 0; p < SUPPORTED_PERSONALITIES; p++) {
 		if (pers == p || pers < 0) {
 			if (not)
 				qual_vec[p][n] &= ~bitflag;
-			else
+			else {
 				qual_vec[p][n] |= bitflag;
+				if (fopts)
+					memcpy(&fault_vec[p][n], fopts,
+					       sizeof(*fopts));
+			}
 		}
 	}
 }
@@ -430,6 +456,8 @@ qualify_one(const unsigned int n, unsigned int bitflag, const int not, const int
 static int
 lookup_class(const char *s)
 {
+	if (strcmp(s, "all") == 0)
+		return 0;
 	if (strcmp(s, "file") == 0)
 		return TRACE_FILE;
 	if (strcmp(s, "ipc") == 0)
@@ -459,7 +487,7 @@ qual_syscall(const char *s, const unsigned int bitflag, const int not)
 		for (p = 0; p < SUPPORTED_PERSONALITIES; ++p) {
 			for (i = 0; i < nsyscall_vec[p]; ++i) {
 				if ((sysent_vec[p][i].sys_flags & n) == n) {
-					qualify_one(i, bitflag, not, p);
+					qualify_one(i, bitflag, not, p, NULL);
 				}
 			}
 		}
@@ -470,7 +498,7 @@ qual_syscall(const char *s, const unsigned int bitflag, const int not)
 		i = string_to_uint(s);
 		if (i >= MAX_NSYSCALLS)
 			return -1;
-		qualify_one(i, bitflag, not, -1);
+		qualify_one(i, bitflag, not, -1, NULL);
 		return 0;
 	}
 
@@ -479,13 +507,153 @@ qual_syscall(const char *s, const unsigned int bitflag, const int not)
 			if (sysent_vec[p][i].sys_name
 			 && strcmp(s, sysent_vec[p][i].sys_name) == 0
 			) {
-				qualify_one(i, bitflag, not, p);
+				qualify_one(i, bitflag, not, p, NULL);
 				rc = 0;
 			}
 		}
 	}
 
 	return rc;
+}
+
+/*
+ * Returns NULL if STR does not start with PREFIX,
+ * or a pointer to the first char in STR after PREFIX.
+ */
+static const char *
+strip_prefix(const char *prefix, const char *str)
+{
+	size_t len = strlen(prefix);
+
+	return (len > strlen(str) || memcmp(prefix, str, len))
+	       ? NULL : str + len;
+}
+
+static int
+string_to_uint16(const char **str, const char *accepted_ending)
+{
+	char *end;
+	long val = strtol(*str, &end, 10);
+
+	if (*str == end || val < 0 || val > 0xffff)
+		return -1;
+
+	if (*end &&
+	    (!accepted_ending ||
+	     (accepted_ending && !strchr(accepted_ending, *end))
+	    ))
+		return -1;
+
+	*str = end;
+	return (int) val;
+}
+
+static int
+find_errno_by_name(const char *name)
+{
+	unsigned int i;
+
+	for (i = 1; i < nerrnos; ++i) {
+		if (errnoent[i] && (strcmp(name, errnoent[i]) == 0))
+			return i;
+	}
+
+	return -1;
+}
+
+static int
+qual_fault(const char *s, const unsigned int bitflag, const int not)
+{
+	struct fault_opts opts = {
+		.first = 1,
+		.step = 1,
+		.err = 0
+	};
+	char *saveptr = NULL;
+	char *copy = xstrdup(s);
+	const char *name = strtok_r(copy, ":", &saveptr);
+	if (!name || !*name)
+		goto bad_format;
+	const char *token;
+	while ((token = strtok_r(NULL, ":", &saveptr))) {
+		const char *val;
+		int intval;
+
+		if ((val = strip_prefix("when=", token))) {
+			/*
+			 * 	== 1+1
+			 * F	== F+0
+			 * F+	== F+1
+			 * F+S
+			 */
+			intval = string_to_uint16(&val, "+");
+			if (intval < 1)
+				goto bad_format;
+
+			opts.first = intval;
+
+			if (*val) {
+				++val;
+				if (*val) {
+					/* F+S */
+					intval = string_to_uint16(&val, NULL);
+					if (intval < 1)
+						goto bad_format;
+					opts.step = intval;
+				} else {
+					/* F+ == F+1 */
+					opts.step = 1;
+				}
+			} else {
+				/* F == F+0 */
+				opts.step = 0;
+			}
+		} else if ((val = strip_prefix("error=", token))) {
+			intval = string_to_uint16(&val, NULL);
+			if (intval == -1)
+				intval = find_errno_by_name(val);
+			if (intval < 1 || intval > 4095)
+				goto bad_format;
+			opts.err = intval;
+		} else
+			goto bad_format;
+	}
+
+	int p;
+	unsigned int i;
+	int n = lookup_class(name);
+	if (n >= 0) {
+		for (p = 0; p < SUPPORTED_PERSONALITIES; ++p)
+			for (i = 0; i < nsyscall_vec[p]; ++i)
+				if (sysent_vec[p][i].sys_name
+				    && (sysent_vec[p][i].sys_flags & n) == n)
+					qualify_one(i, bitflag, not, p, &opts);
+	} else if (*name >= '0' && *name <= '9') {
+		i = string_to_uint(name);
+		if (i >= MAX_NSYSCALLS)
+			goto bad_format;
+		qualify_one(i, bitflag, not, -1, &opts);
+	} else {
+		bool found = false;
+		for (p = 0; p < SUPPORTED_PERSONALITIES; p++) {
+			for (i = 0; i < nsyscall_vec[p]; i++) {
+				if (sysent_vec[p][i].sys_name
+				    && strcmp(name, sysent_vec[p][i].sys_name) == 0) {
+					qualify_one(i, bitflag, not, p, &opts);
+					found = true;
+				}
+			}
+		}
+		if (!found)
+			goto bad_format;
+	}
+
+	free(copy);
+	return 0;
+
+bad_format:
+	free(copy);
+	return -1;
 }
 
 static int
@@ -497,14 +665,14 @@ qual_signal(const char *s, const unsigned int bitflag, const int not)
 		int signo = string_to_uint(s);
 		if (signo < 0 || signo > 255)
 			return -1;
-		qualify_one(signo, bitflag, not, -1);
+		qualify_one(signo, bitflag, not, -1, NULL);
 		return 0;
 	}
 	if (strncasecmp(s, "SIG", 3) == 0)
 		s += 3;
 	for (i = 0; i <= NSIG; i++) {
 		if (strcasecmp(s, signame(i) + 3) == 0) {
-			qualify_one(i, bitflag, not, -1);
+			qualify_one(i, bitflag, not, -1, NULL);
 			return 0;
 		}
 	}
@@ -518,7 +686,7 @@ qual_desc(const char *s, const unsigned int bitflag, const int not)
 		int desc = string_to_uint(s);
 		if (desc < 0 || desc > 0x7fff) /* paranoia */
 			return -1;
-		qualify_one(desc, bitflag, not, -1);
+		qualify_one(desc, bitflag, not, -1, NULL);
 		return 0;
 	}
 	return -1;
@@ -533,8 +701,10 @@ qualify(const char *s)
 	int not;
 	unsigned int i;
 
-	if (num_quals == 0)
+	if (num_quals == 0) {
 		reallocate_qual(MIN_QUALS);
+		reallocate_fault(MIN_QUALS);
+	}
 
 	opt = &qual_options[0];
 	for (i = 0; (p = qual_options[i].option_name); i++) {
@@ -554,14 +724,14 @@ qualify(const char *s)
 		not = 1 - not;
 		s = "all";
 	}
-	if (strcmp(s, "all") == 0) {
+	if (opt->bitflag != QUAL_FAULT && strcmp(s, "all") == 0) {
 		for (i = 0; i < num_quals; i++) {
-			qualify_one(i, opt->bitflag, not, -1);
+			qualify_one(i, opt->bitflag, not, -1, NULL);
 		}
 		return;
 	}
 	for (i = 0; i < num_quals; i++) {
-		qualify_one(i, opt->bitflag, !not, -1);
+		qualify_one(i, opt->bitflag, !not, -1, NULL);
 	}
 	copy = xstrdup(s);
 	for (p = strtok(copy, ","); p; p = strtok(NULL, ",")) {
@@ -798,7 +968,62 @@ clear_regs(void)
 static int get_syscall_args(struct tcb *);
 static int get_syscall_result(struct tcb *);
 static int arch_get_scno(struct tcb *tcp);
+static int arch_set_scno(struct tcb *, long);
 static void get_error(struct tcb *, const bool);
+static int arch_set_error(struct tcb *);
+
+static struct fault_opts *
+tcb_fault_opts(struct tcb *tcp)
+{
+	return tcp->fault_vec[current_personality] ?
+		&tcp->fault_vec[current_personality][tcp->scno] : NULL;
+}
+
+
+static long
+inject_syscall_fault_entering(struct tcb *tcp)
+{
+	if (!tcp->fault_vec[current_personality]) {
+		tcp->fault_vec[current_personality] =
+			xreallocarray(NULL, num_faults,
+				      sizeof(struct fault_opts));
+		memcpy(tcp->fault_vec[current_personality],
+		       fault_vec[current_personality],
+		       num_faults * sizeof(struct fault_opts));
+	}
+
+	struct fault_opts *opts = tcb_fault_opts(tcp);
+
+	if (opts->first == 0)
+		return 0;
+
+	--opts->first;
+
+	if (opts->first != 0)
+		return 0;
+
+	opts->first = opts->step;
+
+	if (!arch_set_scno(tcp, -1))
+		tcp->flags |= TCB_FAULT_INJ;
+
+	return 0;
+}
+
+static long
+update_syscall_fault_exiting(struct tcb *tcp)
+{
+	struct fault_opts *opts = tcb_fault_opts(tcp);
+
+	if (opts && opts->err && tcp->u_error != opts->err) {
+		unsigned long u_error = tcp->u_error;
+		tcp->u_error = opts->err;
+		if (arch_set_error(tcp))
+			tcp->u_error = u_error;
+	}
+
+	return 0;
+}
 
 static int
 trace_syscall_entering(struct tcb *tcp)
@@ -859,7 +1084,15 @@ trace_syscall_entering(struct tcb *tcp)
 
 	tcp->flags &= ~TCB_FILTERED;
 
-	if (cflag == CFLAG_ONLY_STATS || hide_log_until_execve) {
+	if (hide_log_until_execve) {
+		res = 0;
+		goto ret;
+	}
+
+	if (tcp->qual_flg & QUAL_FAULT)
+		inject_syscall_fault_entering(tcp);
+
+	if (cflag == CFLAG_ONLY_STATS) {
 		res = 0;
 		goto ret;
 	}
@@ -888,6 +1121,12 @@ trace_syscall_entering(struct tcb *tcp)
 	return res;
 }
 
+static bool
+syscall_fault_injected(struct tcb *tcp)
+{
+	return tcp->flags & TCB_FAULT_INJ;
+}
+
 static int
 trace_syscall_exiting(struct tcb *tcp)
 {
@@ -914,6 +1153,9 @@ trace_syscall_exiting(struct tcb *tcp)
 	res = (get_regs_error ? -1 : get_syscall_result(tcp));
 	if (filtered(tcp) || hide_log_until_execve)
 		goto ret;
+
+	if (syserror(tcp) && syscall_fault_injected(tcp))
+		update_syscall_fault_exiting(tcp);
 
 	if (cflag) {
 		count_syscall(tcp, &tv);
@@ -945,7 +1187,7 @@ trace_syscall_exiting(struct tcb *tcp)
 		tabto();
 		tprints("= ? <unavailable>\n");
 		line_ended();
-		tcp->flags &= ~TCB_INSYSCALL;
+		tcp->flags &= ~(TCB_INSYSCALL | TCB_FAULT_INJ);
 		tcp->sys_func_rval = 0;
 		free_tcb_priv_data(tcp);
 		return res;
@@ -975,11 +1217,15 @@ trace_syscall_exiting(struct tcb *tcp)
 	tprints(") ");
 	tabto();
 	u_error = tcp->u_error;
+
 	if (tcp->qual_flg & QUAL_RAW) {
-		if (u_error)
+		if (u_error) {
 			tprintf("= -1 (errno %lu)", u_error);
-		else
+			if (syscall_fault_injected(tcp))
+				tprints(" (INJECTED)");
+		} else {
 			tprintf("= %#lx", tcp->u_rval);
+		}
 	}
 	else if (!(sys_res & RVAL_NONE) && u_error) {
 		switch (u_error) {
@@ -1046,6 +1292,8 @@ trace_syscall_exiting(struct tcb *tcp)
 					u_error, strerror(u_error));
 			break;
 		}
+		if (syscall_fault_injected(tcp))
+			tprintf(" (INJECTED)");
 		if ((sys_res & RVAL_STR) && tcp->auxstr)
 			tprintf(" (%s)", tcp->auxstr);
 	}
@@ -1128,7 +1376,7 @@ trace_syscall_exiting(struct tcb *tcp)
 #endif
 
  ret:
-	tcp->flags &= ~TCB_INSYSCALL;
+	tcp->flags &= ~(TCB_INSYSCALL | TCB_FAULT_INJ);
 	tcp->sys_func_rval = 0;
 	free_tcb_priv_data(tcp);
 	return 0;
@@ -1231,6 +1479,7 @@ print_pc(struct tcb *tcp)
 #include "getregs_old.h"
 
 #undef ptrace_getregset_or_getregs
+#undef ptrace_setregset_or_setregs
 #ifdef ARCH_REGS_FOR_GETREGSET
 
 # define ptrace_getregset_or_getregs ptrace_getregset
@@ -1253,6 +1502,26 @@ ptrace_getregset(pid_t pid)
 # endif
 }
 
+# ifndef HAVE_GETREGS_OLD
+#  define ptrace_setregset_or_setregs ptrace_setregset
+static int
+ptrace_setregset(pid_t pid)
+{
+#  ifdef ARCH_IOVEC_FOR_GETREGSET
+	/* variable iovec */
+	return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS,
+		      &ARCH_IOVEC_FOR_GETREGSET);
+#  else
+	/* constant iovec */
+	static struct iovec io = {
+		.iov_base = &ARCH_REGS_FOR_GETREGSET,
+		.iov_len = sizeof(ARCH_REGS_FOR_GETREGSET)
+	};
+	return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
+#  endif
+}
+# endif /* !HAVE_GETREGS_OLD */
+
 #elif defined ARCH_REGS_FOR_GETREGS
 
 # define ptrace_getregset_or_getregs ptrace_getregs
@@ -1266,6 +1535,20 @@ ptrace_getregs(pid_t pid)
 	return ptrace(PTRACE_GETREGS, pid, NULL, &ARCH_REGS_FOR_GETREGS);
 # endif
 }
+
+# ifndef HAVE_GETREGS_OLD
+#  define ptrace_setregset_or_setregs ptrace_setregs
+static int
+ptrace_setregs(pid_t pid)
+{
+#  if defined SPARC || defined SPARC64
+	/* SPARC systems have the meaning of data and addr reversed */
+	return ptrace(PTRACE_SETREGS, pid, (void *) &ARCH_REGS_FOR_GETREGS, 0);
+#  else
+	return ptrace(PTRACE_SETREGS, pid, NULL, &ARCH_REGS_FOR_GETREGS);
+#  endif
+}
+# endif /* !HAVE_GETREGS_OLD */
 
 #endif /* ARCH_REGS_FOR_GETREGSET || ARCH_REGS_FOR_GETREGS */
 
@@ -1308,6 +1591,14 @@ get_regs(pid_t pid)
 
 #endif /* !ptrace_getregset_or_getregs */
 }
+
+#ifdef ptrace_setregset_or_setregs
+static int
+set_regs(pid_t pid)
+{
+	return ptrace_setregset_or_setregs(pid);
+}
+#endif /* ptrace_setregset_or_setregs */
 
 struct sysent_buf {
 	struct tcb *tcp;
@@ -1387,11 +1678,13 @@ get_syscall_result(struct tcb *tcp)
 }
 
 #include "get_scno.c"
+#include "set_scno.c"
 #include "get_syscall_args.c"
 #ifdef USE_GET_SYSCALL_RESULT_REGS
 # include "get_syscall_result.c"
 #endif
 #include "get_error.c"
+#include "set_error.c"
 #ifdef HAVE_GETREGS_OLD
 # include "getregs_old.c"
 #endif
